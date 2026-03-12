@@ -1,0 +1,191 @@
+//+------------------------------------------------------------------+
+//|                                              Physics_Breakout.mq5|
+//|                                  State Machine & Physics Metaphor|
+//+------------------------------------------------------------------+
+#property copyright "Your Custom EA"
+#property version   "1.50"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+CTrade         trade;
+CPositionInfo  posInfo;
+
+//--- Inputs
+input double   RiskPercent     = 1.5;   // Risk per trade (%)
+input int      SqueezeLookback = 14;   
+input color    DashboardColor  = clrCyan; 
+
+//--- Handles
+int h_ema_d1, h_bb_h1, h_ma_h1, h_atr_h1, h_adx_h1, h_rsi_h1;
+
+//--- Global Variables
+datetime last_bar;
+double   prob_score = 0;
+string   mkt_state = "INITIALIZING";
+string   debug_msg = "Waiting for History";
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   h_ema_d1 = iMA(_Symbol, PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE);
+   h_bb_h1  = iBands(_Symbol, PERIOD_H1, 20, 0, 2.0, PRICE_CLOSE);
+   h_ma_h1  = iMA(_Symbol, PERIOD_H1, 20, 0, MODE_EMA, PRICE_CLOSE); 
+   h_atr_h1 = iATR(_Symbol, PERIOD_H1, 20);                           
+   h_adx_h1 = iADX(_Symbol, PERIOD_H1, 14);
+   h_rsi_h1 = iRSI(_Symbol, PERIOD_H1, 14, PRICE_CLOSE);
+
+   CreateDashboard();
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int r) { ObjectsDeleteAll(0, "PHYSICS_"); }
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   ManageActiveTrades();
+   UpdateDashboard();
+
+   // 1. DATA PRE-CHECK (Prevents "Array Out of Range")
+   if(BarsCalculated(h_ema_d1) < 200 || BarsCalculated(h_adx_h1) < 20) return;
+
+   // 2. NEW BAR TRIGGER
+   datetime current_bar = iTime(_Symbol, PERIOD_H1, 0);
+   if(current_bar == last_bar) return; 
+   last_bar = current_bar;
+
+   // 3. FETCH DATA SAFELY
+   double ema_d1[], close_d1[], bb_up[], bb_low[], ma_h1[], atr_h1[], adx[], close_h1[];
+   
+   if(!FillBuf(h_ema_d1, ema_d1, 10)) return;
+   if(!FillBuf(h_bb_h1, bb_up, 10, 1)) return;
+   if(!FillBuf(h_bb_h1, bb_low, 10, 2)) return;
+   if(!FillBuf(h_ma_h1, ma_h1, 10)) return;
+   if(!FillBuf(h_atr_h1, atr_h1, 10)) return;
+   if(!FillBuf(h_adx_h1, adx, 10)) return;
+   
+   if(CopyClose(_Symbol, PERIOD_D1, 0, 10, close_d1) < 5) return;
+   if(CopyClose(_Symbol, PERIOD_H1, 0, 10, close_h1) < 5) return;
+   ArraySetAsSeries(close_d1, true);
+   ArraySetAsSeries(close_h1, true);
+
+   // Volume Calculation
+   long tick_vol[];
+   if(CopyTickVolume(_Symbol, PERIOD_H1, 0, 21, tick_vol) < 20) return;
+   ArraySetAsSeries(tick_vol, true);
+   double avg_vol = 0; for(int i=1; i<=20; i++) avg_vol += (double)tick_vol[i]; avg_vol /= 20.0;
+
+   // 4. PHYSICS EVALUATION
+   double k_up  = ma_h1[1] + (1.5 * atr_h1[1]);
+   double k_low = ma_h1[1] - (1.5 * atr_h1[1]);
+
+   prob_score = 0;
+   mkt_state = "NORMAL";
+   debug_msg = "Criteria: ";
+
+   // Check Squeeze (+2)
+   if(bb_up[1] < k_up && bb_low[1] > k_low) { prob_score += 2; mkt_state = "COILING"; }
+   else debug_msg += "[No Squeeze] ";
+
+   // Check Trend (+1)
+   if(adx[1] > 25.0 && adx[1] > adx[2]) prob_score += 1;
+   else debug_msg += "[Low Trend] ";
+
+   // Check Volume (+1)
+   if((double)tick_vol[1] > (avg_vol * 1.3)) prob_score += 1;
+   else debug_msg += "[Low Vol] ";
+
+   // 5. EXECUTION ENGINE
+   if(prob_score >= 3 && !posInfo.Select(_Symbol)) 
+   {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      // Gravity Filters (Daily Trend)
+      bool buy_gravity  = (close_d1[1] > ema_d1[1]);
+      bool sell_gravity = (close_d1[1] < ema_d1[1]);
+
+      if(buy_gravity && close_h1[1] > bb_up[1]) {
+         double sl = bb_low[1];
+         double tp = ask + ((ask - sl) * 2.0);
+         trade.Buy(CalcSize(ask, sl), _Symbol, ask, sl, tp, "Phase 1: Entry");
+      }
+      else if(sell_gravity && close_h1[1] < bb_low[1]) {
+         double sl = bb_up[1];
+         double tp = bid - ((sl - bid) * 2.0);
+         trade.Sell(CalcSize(bid, sl), _Symbol, bid, sl, tp, "Phase 1: Entry");
+      }
+      else {
+         debug_msg = "Trend Mismatch (Gravity)";
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| RISK MANAGEMENT: PHASES 1-4                                      |
+//+------------------------------------------------------------------+
+void ManageActiveTrades()
+{
+   if(!posInfo.Select(_Symbol)) return;
+
+   double rsi_b[];
+   if(!FillBuf(h_rsi_h1, rsi_b, 10)) return;
+   
+   double entry = posInfo.PriceOpen();
+   double sl    = posInfo.StopLoss();
+   double tp    = posInfo.TakeProfit();
+   double risk  = MathAbs(tp - entry) / 2.0;
+   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(posInfo.PositionType() == POSITION_TYPE_BUY) {
+      // Phase 2: Move to BE at 1:1
+      if(bid >= entry + risk && sl < entry) trade.PositionModify(posInfo.Ticket(), entry, tp);
+      // Phase 4: RSI Panic Exit at 1.5R
+      if(bid >= entry + (risk * 1.5) && rsi_b[0] > 70) trade.PositionClose(posInfo.Ticket());
+   } else {
+      // Phase 2: Move to BE at 1:1
+      if(ask <= entry - risk && sl > entry) trade.PositionModify(posInfo.Ticket(), entry, tp);
+      // Phase 4: RSI Panic Exit at 1.5R
+      if(ask <= entry - (risk * 1.5) && rsi_b[0] < 30) trade.PositionClose(posInfo.Ticket());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| UTILITIES                                                        |
+//+------------------------------------------------------------------+
+bool FillBuf(int h, double &b[], int c, int i=0) {
+   if(CopyBuffer(h, i, 0, c, b) < c) return false;
+   ArraySetAsSeries(b, true);
+   return true;
+}
+
+double CalcSize(double entry, double sl) {
+   double risk_val = AccountInfoDouble(ACCOUNT_BALANCE) * (RiskPercent/100.0);
+   double tick_val = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double points   = MathAbs(entry - sl) / SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(points <= 0) return 0.01;
+   double lots = NormalizeDouble(risk_val / (points * tick_val), 2);
+   return MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), MathMin(lots, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)));
+}
+
+void CreateDashboard() {
+   string ids[] = {"T","S","ST","D","P"};
+   for(int i=0; i<5; i++) {
+      ObjectCreate(0, "PHYSICS_"+ids[i], OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "PHYSICS_"+ids[i], OBJPROP_XDISTANCE, 20);
+      ObjectSetInteger(0, "PHYSICS_"+ids[i], OBJPROP_YDISTANCE, 30 + (i*18));
+      ObjectSetInteger(0, "PHYSICS_"+ids[i], OBJPROP_COLOR, DashboardColor);
+   }
+}
+
+void UpdateDashboard() {
+   ObjectSetString(0,"PHYSICS_T",OBJPROP_TEXT,"SYSTEM: PHYSICS BREAKOUT v1.5");
+   ObjectSetString(0,"PHYSICS_S",OBJPROP_TEXT,"SCORE: "+DoubleToString(prob_score,0)+"/4");
+   ObjectSetString(0,"PHYSICS_ST",OBJPROP_TEXT,"MARKET: "+mkt_state);
+   ObjectSetString(0,"PHYSICS_D",OBJPROP_TEXT,"DEBUG: "+debug_msg);
+   string ph = posInfo.Select(_Symbol) ? (posInfo.StopLoss() == posInfo.PriceOpen() ? "PHASE 2 (BREAK-EVEN)" : "PHASE 1 (ACTIVE)") : "SEARCHING...";
+   ObjectSetString(0,"PHYSICS_P",OBJPROP_TEXT,"TRADE: "+ph);
+}

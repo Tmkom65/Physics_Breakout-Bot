@@ -1,0 +1,125 @@
+//+------------------------------------------------------------------+
+//|                                     Physics_Breakout_v1_9.mq5    |
+//|                    Asymmetric Risk & Momentum Filter Edition      |
+//+------------------------------------------------------------------+
+#property copyright "Physics Engine EA"
+#property version   "1.90"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+CTrade         trade;
+CPositionInfo  posInfo;
+
+//--- INPUTS
+input group "--- ASYMMETRIC RISK ---"
+input double   LongRiskPercent  = 1.5;    // Risk for BUY trades (%)
+input double   ShortRiskPercent = 0.5;    // NEW: Lower risk for SELL trades (%)
+input double   TakeProfitMult   = 2.0;    
+
+input group "--- MOMENTUM FILTERS ---"
+input int      ShortRSIThreshold = 45;    // Only SELL if RSI is below this
+input bool     UseTimeGuard      = true;  // Skip NY Open chaos
+input bool     UseVolGuard       = true;  // Skip News spikes
+
+//--- HANDLES & GLOBALS
+int h_ema_d1, h_bb_h1, h_ma_h1, h_atr_h1, h_rsi_h1;
+datetime last_bar;
+string   mkt_state = "IDLE";
+
+//+------------------------------------------------------------------+
+int OnInit() {
+   h_ema_d1 = iMA(_Symbol, PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE);
+   h_bb_h1  = iBands(_Symbol, PERIOD_H1, 20, 0, 2.0, PRICE_CLOSE);
+   h_ma_h1  = iMA(_Symbol, PERIOD_H1, 20, 0, MODE_SMA, PRICE_CLOSE); 
+   h_atr_h1 = iATR(_Symbol, PERIOD_H1, 14);                           
+   h_rsi_h1 = iRSI(_Symbol, PERIOD_H1, 14, PRICE_CLOSE);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+void OnTick() {
+   if(!posInfo.Select(_Symbol)) ManageEntries();
+   ManageActiveTrades();
+}
+
+void ManageEntries() {
+   // 1. DATA SYNC
+   if(BarsCalculated(h_ema_d1) < 200) return;
+
+   // 2. TIME GUARD
+   if(UseTimeGuard) {
+      MqlDateTime dt; TimeCurrent(dt);
+      if((dt.hour == 14 && dt.min >= 30) || dt.hour == 15 || (dt.hour == 16 && dt.min <= 30)) return;
+   }
+
+   // 3. NEW BAR
+   datetime current_bar = iTime(_Symbol, PERIOD_H1, 0);
+   if(current_bar == last_bar) return; 
+   last_bar = current_bar;
+
+   // 4. FETCH DATA
+   double ema_d1[], bb_up[], bb_low[], ma_h1[], atr_h1[], rsi[], close_h1[], close_d1[];
+   CopyBuffer(h_ema_d1, 0, 0, 5, ema_d1); ArraySetAsSeries(ema_d1, true);
+   CopyBuffer(h_bb_h1, 1, 0, 5, bb_up); ArraySetAsSeries(bb_up, true);
+   CopyBuffer(h_bb_h1, 2, 0, 5, bb_low); ArraySetAsSeries(bb_low, true);
+   CopyBuffer(h_ma_h1, 0, 0, 5, ma_h1); ArraySetAsSeries(ma_h1, true);
+   CopyBuffer(h_atr_h1, 0, 0, 5, atr_h1); ArraySetAsSeries(atr_h1, true);
+   CopyBuffer(h_rsi_h1, 0, 0, 5, rsi); ArraySetAsSeries(rsi, true);
+   CopyClose(_Symbol, PERIOD_H1, 0, 5, close_h1); ArraySetAsSeries(close_h1, true);
+   CopyClose(_Symbol, PERIOD_D1, 0, 5, close_d1); ArraySetAsSeries(close_d1, true);
+
+   // 5. VOLATILITY GUARD
+   if(UseVolGuard) {
+      double candle_size = MathAbs(close_h1[1] - iOpen(_Symbol, PERIOD_H1, 1));
+      if(candle_size > (atr_h1[1] * 2.5)) return;
+   }
+
+   // 6. SQUEEZE PHYSICS
+   double k_up = ma_h1[1] + (1.5 * atr_h1[1]);
+   double k_low = ma_h1[1] - (1.5 * atr_h1[1]);
+   bool is_squeezed = (bb_up[1] < k_up && bb_low[1] > k_low);
+
+   if(!is_squeezed) return;
+
+   // 7. ASYMMETRIC EXECUTION
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // BUY: High confidence, Full risk
+   if(close_d1[1] > ema_d1[1] && close_h1[1] > bb_up[1]) {
+      double sl = bb_low[1];
+      double tp = ask + ((ask - sl) * TakeProfitMult);
+      trade.Buy(CalcSize(ask, sl, LongRiskPercent), _Symbol, ask, sl, tp, "Phase 1: Buy");
+   }
+   // SELL: Low confidence, Lower risk + RSI Filter
+   else if(close_d1[1] < ema_d1[1] && close_h1[1] < bb_low[1] && rsi[1] < ShortRSIThreshold) {
+      double sl = bb_up[1];
+      double tp = bid - ((sl - bid) * TakeProfitMult);
+      trade.Sell(CalcSize(bid, sl, ShortRiskPercent), _Symbol, bid, sl, tp, "Phase 1: Sell");
+   }
+}
+
+void ManageActiveTrades() {
+   if(!posInfo.Select(_Symbol)) return;
+   double entry = posInfo.PriceOpen();
+   double sl = posInfo.StopLoss();
+   double tp = posInfo.TakeProfit();
+   double risk_dist = MathAbs(tp - entry) / TakeProfitMult;
+   double price = (posInfo.PositionType()==POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(posInfo.PositionType() == POSITION_TYPE_BUY) {
+      if(price >= entry + risk_dist && sl < entry) trade.PositionModify(posInfo.Ticket(), entry, tp);
+   } else {
+      if(price <= entry - risk_dist && sl > entry) trade.PositionModify(posInfo.Ticket(), entry, tp);
+   }
+}
+
+double CalcSize(double entry, double sl, double risk_p) {
+   double risk_val = AccountInfoDouble(ACCOUNT_BALANCE) * (risk_p/100.0);
+   double tick_val = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double points = MathAbs(entry - sl) / SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(points <= 0) return 0.01;
+   return NormalizeDouble(risk_val / (points * tick_val), 2);
+}

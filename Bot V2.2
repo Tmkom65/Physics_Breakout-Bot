@@ -1,0 +1,148 @@
+//+------------------------------------------------------------------+
+//|                                     Physics_Breakout_v2_2.mq5    |
+//|                    THE SNIPER EDITION: Time-Filtered Hybrid      |
+//+------------------------------------------------------------------+
+#property copyright "Physics Engine EA"
+#property version   "2.20"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+CTrade         trade;
+CPositionInfo  posInfo;
+
+//--- INPUTS
+input group "--- HYBRID RISK MANAGEMENT ---"
+input double   LongRiskPercent  = 1.0;    // v1.5 Safety logic
+input double   ShortRiskPercent = 0.3;    // Asymmetric risk profiling
+input double   MaxLotSize       = 5.0;    // Hard ceiling for safety
+input double   TakeProfitMult   = 2.0;    
+
+input group "--- PHYSICS TUNING ---"
+input double   SqueezeThreshold  = 1.4;   // Optimized Squeeze
+input bool     UseTrailingPhysics = true; // Dynamic SL following Bollinger Bands
+input int      TrailingStartPct   = 50;   // Start trailing after 50% of TP distance
+
+input group "--- MOMENTUM FILTERS ---"
+input int      ShortRSIThreshold  = 45;    
+input bool     UseSniperTimeGuard = true; // London (08-12) & NY Late (17-20)
+input bool     UseVolGuard        = true; // Anti-trap volatility filter
+
+//--- HANDLES & GLOBALS
+int h_ema_d1, h_bb_h1, h_ma_h1, h_atr_h1, h_rsi_h1;
+datetime last_bar;
+
+//+------------------------------------------------------------------+
+int OnInit() {
+   h_ema_d1 = iMA(_Symbol, PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE);
+   h_bb_h1  = iBands(_Symbol, PERIOD_H1, 20, 0, 2.0, PRICE_CLOSE);
+   h_ma_h1  = iMA(_Symbol, PERIOD_H1, 20, 0, MODE_SMA, PRICE_CLOSE); 
+   h_atr_h1 = iATR(_Symbol, PERIOD_H1, 14);                           
+   h_rsi_h1 = iRSI(_Symbol, PERIOD_H1, 14, PRICE_CLOSE);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+void OnTick() {
+   if(!posInfo.Select(_Symbol)) ManageEntries();
+   else ManageActiveTrades();
+}
+
+void ManageEntries() {
+   if(BarsCalculated(h_ema_d1) < 200) return;
+
+   // NEW: SNIPER TIME WINDOWS
+   if(UseSniperTimeGuard) {
+      MqlDateTime dt; 
+      TimeCurrent(dt);
+      
+      // Focus on high-liquidity sessions only
+      bool isLondonSession = (dt.hour >= 8 && dt.hour <= 12); 
+      bool isNYAfternoon   = (dt.hour >= 17 && dt.hour <= 20); 
+      
+      if(!isLondonSession && !isNYAfternoon) return;
+   }
+
+   datetime current_bar = iTime(_Symbol, PERIOD_H1, 0);
+   if(current_bar == last_bar) return; 
+   last_bar = current_bar;
+
+   double ema_d1[], bb_up[], bb_low[], ma_h1[], atr_h1[], rsi[], close_h1[], close_d1[];
+   CopyBuffer(h_ema_d1, 0, 0, 2, ema_d1); ArraySetAsSeries(ema_d1, true);
+   CopyBuffer(h_bb_h1, 1, 0, 2, bb_up); ArraySetAsSeries(bb_up, true);
+   CopyBuffer(h_bb_h1, 2, 0, 2, bb_low); ArraySetAsSeries(bb_low, true);
+   CopyBuffer(h_ma_h1, 0, 0, 2, ma_h1); ArraySetAsSeries(ma_h1, true);
+   CopyBuffer(h_atr_h1, 0, 0, 2, atr_h1); ArraySetAsSeries(atr_h1, true);
+   CopyBuffer(h_rsi_h1, 0, 0, 2, rsi); ArraySetAsSeries(rsi, true);
+   CopyClose(_Symbol, PERIOD_H1, 0, 2, close_h1); ArraySetAsSeries(close_h1, true);
+   CopyClose(_Symbol, PERIOD_D1, 0, 2, close_d1); ArraySetAsSeries(close_d1, true);
+
+   if(UseVolGuard) {
+      double candle_size = MathAbs(close_h1[1] - iOpen(_Symbol, PERIOD_H1, 1));
+      if(candle_size > (atr_h1[1] * 2.5)) return;
+   }
+
+   // PHYSICS: SQUEEZE LOGIC
+   double k_up = ma_h1[1] + (SqueezeThreshold * atr_h1[1]);
+   double k_low = ma_h1[1] - (SqueezeThreshold * atr_h1[1]);
+   bool is_squeezed = (bb_up[1] < k_up && bb_low[1] > k_low);
+
+   if(!is_squeezed) return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // HYBRID EXECUTION
+   if(close_d1[1] > ema_d1[1] && close_h1[1] > bb_up[1]) {
+      double sl = bb_low[1];
+      double tp = ask + ((ask - sl) * TakeProfitMult);
+      trade.Buy(CalcSize(ask, sl, LongRiskPercent), _Symbol, ask, sl, tp, "Sniper Long");
+   }
+   else if(close_d1[1] < ema_d1[1] && close_h1[1] < bb_low[1] && rsi[1] < ShortRSIThreshold) {
+      double sl = bb_up[1];
+      double tp = bid - ((sl - bid) * TakeProfitMult);
+      trade.Sell(CalcSize(bid, sl, ShortRiskPercent), _Symbol, bid, sl, tp, "Sniper Short");
+   }
+}
+
+void ManageActiveTrades() {
+   double entry = posInfo.PriceOpen();
+   double current_sl = posInfo.StopLoss();
+   double tp = posInfo.TakeProfit();
+   double risk_dist = MathAbs(tp - entry) / TakeProfitMult;
+   double price = (posInfo.PositionType()==POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   double bb_up[], bb_low[];
+   CopyBuffer(h_bb_h1, 1, 0, 1, bb_up); 
+   CopyBuffer(h_bb_h1, 2, 0, 1, bb_low);
+
+   if(posInfo.PositionType() == POSITION_TYPE_BUY) {
+      if(price >= entry + (risk_dist * 0.5) && current_sl < entry) {
+         trade.PositionModify(posInfo.Ticket(), entry, tp);
+      }
+      else if(UseTrailingPhysics && price > entry + (risk_dist * (TrailingStartPct/100.0))) {
+         double new_sl = NormalizeDouble(bb_low[0], _Digits);
+         if(new_sl > current_sl + (20 * _Point)) trade.PositionModify(posInfo.Ticket(), new_sl, tp);
+      }
+   } else {
+      if(price <= entry - (risk_dist * 0.5) && current_sl > entry) {
+         trade.PositionModify(posInfo.Ticket(), entry, tp);
+      }
+      else if(UseTrailingPhysics && price < entry - (risk_dist * (TrailingStartPct/100.0))) {
+         double new_sl = NormalizeDouble(bb_up[0], _Digits);
+         if(new_sl < current_sl - (20 * _Point)) trade.PositionModify(posInfo.Ticket(), new_sl, tp);
+      }
+   }
+}
+
+double CalcSize(double entry, double sl, double risk_p) {
+   double risk_val = AccountInfoDouble(ACCOUNT_BALANCE) * (risk_p/100.0);
+   double tick_val = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double points = MathAbs(entry - sl) / SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(points <= 0) return 0.01;
+   double size = NormalizeDouble(risk_val / (points * tick_val), 2);
+   
+   if(size > MaxLotSize) size = MaxLotSize;
+   return (size < 0.01) ? 0.01 : size;
+}
